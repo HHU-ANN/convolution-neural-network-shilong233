@@ -1,6 +1,6 @@
-# 在该文件NeuralNetwork类中定义你的模型
+# 在该文件NeuralNetwork类中定义你的模型 
 # 在自己电脑上训练好模型，保存参数，在这里读取模型参数（不要使用JIT读取），在main中返回读取了模型参数的模型
-import math
+
 import os
 
 os.system("sudo pip3 install torch")
@@ -10,143 +10,145 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torchvision
-import torchvision.transforms as transforms
+
 from torch.utils.data import DataLoader
+    
+if torch.cuda.is_available():
+    device = torch.device("cuda:0")
+    print("使用GPU进行训练")
+else:
+    device = torch.device("cpu")
+    print("使用cpu进行训练")
 
-# 判断是否有GPU
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-class BasicBlock(nn.Module):
-    """搭建BasicBlock模块"""
-    expansion = 1
-
-    def __init__(self, in_channel, out_channel, stride=1, downsample=None):
-        super(BasicBlock, self).__init__()
-
-        # 使用BN层是不需要使用bias的，bias最后会抵消掉
-        self.conv1 = nn.Conv2d(in_channel, out_channel, kernel_size=3, padding=1, stride=stride, bias=False)
-        self.bn1 = nn.BatchNorm2d(out_channel)  # BN层, BN层放在conv层和relu层中间使用
-        self.conv2 = nn.Conv2d(out_channel, out_channel, kernel_size=3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(out_channel)
-
-        self.downsample = downsample
-        self.relu = nn.ReLU(inplace=True)
-
-    # 前向传播
-    def forward(self, X):
-        identity = X
-        Y = self.relu(self.bn1(self.conv1(X)))
-        Y = self.bn2(self.conv2(Y))
-
-        if self.downsample is not None:  # 保证原始输入X的size与主分支卷积后的输出size叠加时维度相同
-            identity = self.downsample(X)
-
-        return self.relu(Y + identity)
-        """神经网络的前向传播函数:
-            它接受一个输入张量X，然后通过一些卷积层和批量归一化层来计算输出张量Y。
-            如果存在下采样层，它将对输入张量进行下采样以使其与输出张量的尺寸相同。
-            最后，输出张量Y和输入张量X的恒等映射相加并通过ReLU激活函数进行激活。"""
-
-
-class BottleNeck(nn.Module):
-    """搭建BottleNeck模块"""
-    # BottleNeck模块最终输出out_channel是Residual模块输入in_channel的size的4倍(Residual模块输入为64)，shortcut分支in_channel
-    # 为Residual的输入64，因此需要在shortcut分支上将Residual模块的in_channel扩张4倍，使之与原始输入图片X的size一致
-    expansion = 4
+# todo Bottleneck
+class Bottleneck(nn.Module):
+    """
+    __init__
+        in_channel：残差块输入通道数
+        out_channel：残差块输出通道数
+        stride：卷积步长
+        downsample：在_make_layer函数中赋值，用于控制shortcut图片下采样 H/2 W/2
+    """
+    expansion = 4  # 残差块第3个卷积层的通道膨胀倍率
 
     def __init__(self, in_channel, out_channel, stride=1, downsample=None):
-        super(BottleNeck, self).__init__()
-        # 默认原始输入为224，经过7x7层和3x3层之后BottleNeck的输入降至64
-        self.conv1 = nn.Conv2d(in_channel, out_channel, kernel_size=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(out_channel)  # BN层, BN层放在conv层和relu层中间使用
-        self.conv2 = nn.Conv2d(out_channel, out_channel, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(out_channel)
-        self.conv3 = nn.Conv2d(out_channel, out_channel * self.expansion, kernel_size=1, bias=False)
-        self.bn3 = nn.BatchNorm2d(out_channel * self.expansion)  # Residual中第三层out_channel扩张到in_channel的4倍
+        super(Bottleneck, self).__init__()
+
+        self.conv1 = nn.Conv2d(in_channels=in_channel, out_channels=out_channel, kernel_size=1, stride=1,
+                               bias=False)  # H,W不变。C: in_channel -> out_channel
+        self.bn1 = nn.BatchNorm2d(num_features=out_channel)
+        self.conv2 = nn.Conv2d(in_channels=out_channel, out_channels=out_channel, kernel_size=3, stride=stride,
+                               bias=False, padding=1)  # H/2，W/2。C不变
+        self.bn2 = nn.BatchNorm2d(num_features=out_channel)
+        self.conv3 = nn.Conv2d(in_channels=out_channel, out_channels=out_channel * self.expansion, kernel_size=1,
+                               stride=1, bias=False)  # H,W不变。C: out_channel -> 4*out_channel
+        self.bn3 = nn.BatchNorm2d(num_features=out_channel * self.expansion)
+        self.relu = nn.ReLU(inplace=True)
 
         self.downsample = downsample
+
+    def forward(self, x):
+        identity = x  # 将原始输入暂存为shortcut的输出
+        if self.downsample is not None:
+            identity = self.downsample(
+                x)  # 如果需要下采样，那么shortcut后:H/2，W/2。C: out_channel -> 4*out_channel(见ResNet中的downsample实现)
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.relu(out)
+
+        out = self.conv3(out)
+        out = self.bn3(out)
+
+        out += identity  # 残差连接
+        out = self.relu(out)
+
+        return out
+
+
+class ResNet(nn.Module):
+    """
+    __init__
+        block: 堆叠的基本模块
+        block_num: 基本模块堆叠个数,是一个list,对于resnet50=[3,4,6,3]
+        num_classes: 全连接之后的分类特征维度
+
+    _make_layer
+        block: 堆叠的基本模块
+        channel: 每个stage中堆叠模块的第一个卷积的卷积核个数，对resnet50分别是:64,128,256,512
+        block_num: 当期stage堆叠block个数
+        stride: 默认卷积步长
+    """
+
+    def __init__(self, block, block_num, num_classes=10):
+        super(ResNet, self).__init__()
+        self.in_channel = 64  # conv1的输出维度
+
+        self.conv1 = nn.Conv2d(in_channels=3, out_channels=self.in_channel, kernel_size=7, stride=2, padding=3,
+                               bias=False)  # H/2,W/2。C:3->64
+        self.bn1 = nn.BatchNorm2d(self.in_channel)
         self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)  # H/2,W/2。C不变
+        self.layer1 = self._make_layer(block=block, channel=64, block_num=block_num[0],
+                                       stride=1)  # H,W不变。downsample控制的shortcut，out_channel=64x4=256
+        self.layer2 = self._make_layer(block=block, channel=128, block_num=block_num[1],
+                                       stride=2)  # H/2, W/2。downsample控制的shortcut，out_channel=128x4=512
+        self.layer3 = self._make_layer(block=block, channel=256, block_num=block_num[2],
+                                       stride=2)  # H/2, W/2。downsample控制的shortcut，out_channel=256x4=1024
+        self.layer4 = self._make_layer(block=block, channel=512, block_num=block_num[3],
+                                       stride=2)  # H/2, W/2。downsample控制的shortcut，out_channel=512x4=2048
 
-    # 前向传播
-    def forward(self, X):
-        identity = X
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))  # 将每张特征图大小->(1,1)，则经过池化后的输出维度=通道数
+        self.fc = nn.Linear(in_features=512 * block.expansion, out_features=num_classes)
 
-        Y = self.relu(self.bn1(self.conv1(X)))
-        Y = self.relu(self.bn2(self.conv2(Y)))
-        Y = self.bn3(self.conv3(Y))
-
-        if self.downsample is not None:  # 保证原始输入X的size与主分支卷积后的输出size叠加时维度相同
-            identity = self.downsample(X)
-
-        return self.relu(Y + identity)
-
-
-class NeuralNetwork(nn.Module):
-    """搭建ResNet-layer通用框架"""
-
-    # num_classes是训练集的分类个数，include_top是在ResNet的基础上搭建更加复杂的网络时用到，此处用不到
-    def __init__(self, residual, num_residuals, num_classes=1000, include_top=True):
-        super(NeuralNetwork, self).__init__()
-
-        self.out_channel = 64  # 输出通道数(即卷积核个数)，会生成与设定的输出通道数相同的卷积核个数
-        self.include_top = include_top
-
-        self.conv1 = nn.Conv2d(3, self.out_channel, kernel_size=7, stride=2, padding=3,
-                               bias=False)  # 3表示输入特征图像的RGB通道数为3，即图片数据的输入通道为3
-        self.bn1 = nn.BatchNorm2d(self.out_channel)
-        self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        self.conv2 = self.residual_block(residual, 64, num_residuals[0])
-        self.conv3 = self.residual_block(residual, 128, num_residuals[1], stride=2)
-        self.conv4 = self.residual_block(residual, 256, num_residuals[2], stride=2)
-        self.conv5 = self.residual_block(residual, 512, num_residuals[3], stride=2)
-        if self.include_top:
-            self.avgpool = nn.AdaptiveAvgPool2d((1, 1))  # output_size = (1, 1)
-            self.fc = nn.Linear(512 * residual.expansion, num_classes)
-
-        # 对conv层进行初始化操作
-        for m in self.modules():
+        for m in self.modules():  # 权重初始化
             if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')  # fan_out保留了向后传递中权重的大小。
-            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
 
-    def residual_block(self, residual, channel, num_residuals, stride=1):
-        downsample = None
-
-        # 用在每个conv_x组块的第一层的shortcut分支上，此时上个conv_x输出out_channel与本conv_x所要求的输入in_channel通道数不同，
-        # 所以用downsample调整进行升维，使输出out_channel调整到本conv_x后续处理所要求的维度。
-        # 同时stride=2进行下采样减小尺寸size，(注：conv2时没有进行下采样，conv3-5进行下采样，size=56、28、14、7)。
-        if stride != 1 or self.out_channel != channel * residual.expansion:
+    def _make_layer(self, block, channel, block_num, stride=1):
+        downsample = None  # 用于控制shorcut路的
+        if stride != 1 or self.in_channel != channel * block.expansion:
+            # 对resnet50：conv2中特征图尺寸H,W不需要下采样/2，但是通道数x4，因此shortcut通道数也需要x4。对其余conv3,4,5，既要特征图尺寸H,W/2，又要shortcut维度x4
             downsample = nn.Sequential(
-                nn.Conv2d(self.out_channel, channel * residual.expansion, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(channel * residual.expansion))
+                nn.Conv2d(in_channels=self.in_channel, out_channels=channel * block.expansion, kernel_size=1,
+                          stride=stride,
+                          bias=False),  # out_channels决定输出通道数x4，stride决定特征图尺寸H,W/2
+                nn.BatchNorm2d(num_features=channel * block.expansion))
 
-        block = []  # block列表保存某个conv_x组块里for循环生成的所有层
-        # 添加每一个conv_x组块里的第一层，第一层决定此组块是否需要下采样(后续层不需要)
-        block.append(residual(self.out_channel, channel, downsample=downsample, stride=stride))
-        self.out_channel = channel * residual.expansion  # 输出通道out_channel扩张
+        layers = []
+        # 每一个convi_x的结构保存在一个layers列表中，i={2,3,4,5}
+        layers.append(block(in_channel=self.in_channel, out_channel=channel, downsample=downsample,
+                            stride=stride))  # 定义convi_x中的第一个残差块，只有第一个需要设置downsample和stride
+        self.in_channel = channel * block.expansion  # 在下一次调用_make_layer函数的时候，self.in_channel已经x4
 
-        for _ in range(1, num_residuals):
-            block.append(residual(self.out_channel, channel))
+        for _ in range(1, block_num):  # 通过循环堆叠其余残差块(堆叠了剩余的block_num-1个)
+            layers.append(block(in_channel=self.in_channel, out_channel=channel))
 
-        # 非关键字参数的特征是一个星号*加上参数名，比如*number，定义后，number可以接收任意数量的参数，并将它们储存在一个tuple中
-        return nn.Sequential(*block)
+        return nn.Sequential(*layers)  # '*'的作用是将list转换为非关键字参数传入
 
-    # 前向传播
-    def forward(self, X):
-        Y = self.relu(self.bn1(self.conv1(X)))
-        Y = self.maxpool(Y)
-        Y = self.conv5(self.conv4(self.conv3(self.conv2(Y))))
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
 
-        if self.include_top:
-            Y = self.avgpool(Y)
-            Y = torch.flatten(Y, 1)
-            Y = self.fc(Y)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
 
-        return Y
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.fc(x)
+        return x
 
+
+def resnet50(num_classes=10):
+    return ResNet(block=Bottleneck, block_num=[3, 4, 6, 3], num_classes=num_classes)
 
 
 def read_data():
@@ -159,8 +161,9 @@ def read_data():
     return dataset_train, dataset_val, data_loader_train, data_loader_val
 
 def main():
-    model = NeuralNetwork(BottleNeck, [3, 4, 6, 3]) # 若有参数则传入参数
+    model = resnet50()
     current_dir = os.path.dirname(os.path.abspath(__file__))
     parent_dir = os.path.dirname(current_dir)
-    model.load_state_dict(torch.load(parent_dir + '/pth/model.pth',  map_location='cpu'))
+    model.load_state_dict(torch.load(parent_dir + '/pth/best_model.pth', map_location='cpu'))
     return model
+    
